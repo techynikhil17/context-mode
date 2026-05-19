@@ -329,6 +329,167 @@ describe("Pi Extension", () => {
         expect(result.blocked).not.toBe(true);
       }
     });
+
+    // ── Issue #625 — escape hatches + quoted-string false positives ──
+    //
+    // The original BLOCKED_BASH_PATTERNS blocked every curl/wget unconditionally
+    // and matched inside quoted CLI arguments. Two consequences:
+    //
+    //   1. False positive: `gh issue list --search "...curl..."` was blocked
+    //      because the literal word `curl` appeared inside the quoted search
+    //      argument. The reporter literally could not file the issue via `gh`
+    //      until they rephrased the query.
+    //
+    //   2. Unrecoverable trap: when the MCP bridge dies, the agent's only
+    //      escape hatch is a disk-buffered HTTP download (curl -s -o file).
+    //      With every curl/wget invocation blocked, there is no way to fetch
+    //      a URL until the user restarts Pi entirely.
+    //
+    // Fix mirrors hooks/core/routing.mjs:660–722:
+    //   - Strip quoted content before regex matching
+    //   - Split on chain operators (&&, ||, ;)
+    //   - Allow segments that are: silent (-s/-q) + file output (-o/-O or >)
+    //     + no verbose (-v) + no stdout alias (-o -, -o /dev/stdout)
+    //
+    // This preserves the original "do not flood context" intent while letting
+    // the agent gracefully self-recover when MCP is unreachable.
+
+    it("does NOT block gh command with 'curl' inside quoted --search argument (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'gh issue list --search "BLOCKED_BASH_PATTERNS curl wget block"',
+        },
+      });
+
+      // The literal word "curl" appears only inside a quoted argument; the
+      // command itself is `gh`, which has nothing to do with HTTP fetching.
+      // Stripping quoted content before matching must allow this through.
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("does NOT block echo with 'wget' inside a quoted log message (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'echo "users tried to wget the bundle and it failed"',
+        },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows curl with silent + file output for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o /tmp/data.json https://example.com/api" },
+      });
+
+      // -s (silent) + -o file means the body never enters context. This must
+      // remain available as an escape hatch when ctx_fetch_and_index is
+      // unreachable (e.g. MCP bridge dead between requests).
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows wget with quiet + output-document for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "wget -q -O /tmp/data.json https://example.com/api" },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("still blocks curl that would flood context (no file output)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl https://example.com/big-response" },
+      });
+
+      // No -o flag → body goes straight to stdout → straight into context.
+      // Must remain blocked.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks curl -o - (explicit stdout alias)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o - https://example.com/api" },
+      });
+
+      // -o - means stdout, which feeds context — must remain blocked even
+      // when silent flag is present.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks verbose curl (floods stderr → context)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -v -s -o /tmp/x.json https://example.com" },
+      });
+
+      // -v dumps request/response headers to stderr — flooding context.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("blocks chained command if ANY segment is unsafe curl", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl https://example.com/b",
+        },
+      });
+
+      // First segment safe, second unsafe → must block the whole chain.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("allows chained command where every curl segment is safe", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl -s -o /tmp/b.json https://example.com/b",
+        },
+      });
+
+      // Both segments: silent + file output + no stdout alias + no verbose.
+      // The chain must pass.
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
   });
 
   // ═══════════════════════════════════════════════════════════
