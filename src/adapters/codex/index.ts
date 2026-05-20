@@ -25,7 +25,7 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { BaseAdapter } from "../base.js";
+import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
 import { resolveCodexConfigDir } from "./paths.js";
 
 import {
@@ -324,7 +324,14 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // before falling back to the $CODEX_HOME-rooted default. Settings.toml
+    // and hooks.json continue to live under getConfigDir() so the Codex CLI
+    // sees its own config in the expected place.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -343,6 +350,12 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
 
   getMemoryDir(): string {
     // Codex uses "memories" (plural), not the default "memory".
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR for context-mode-owned
+    // persistent memory while preserving the platform-native plural folder
+    // name so legacy Codex tooling continues to find it when DATA_DIR is
+    // unset. Under the override, layout is `<DATA_DIR>/context-mode/memories`.
+    const override = resolveContextModeDataRoot();
+    if (override) return join(override, "context-mode", "memories");
     return join(this.getConfigDir(), "memories");
   }
 

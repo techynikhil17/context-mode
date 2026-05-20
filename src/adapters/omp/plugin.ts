@@ -28,7 +28,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { SessionDB } from "../../session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { extractEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
@@ -69,6 +69,7 @@ const BLOCKED_BASH_PATTERNS: RegExp[] = [
 // session_start so multi-session reuse within a long-lived plugin
 // process keeps event attribution correct.
 let _db: SessionDB | null = null;
+let _dbPath = "";
 let _sessionId = "";
 
 const _ompAdapter = new OMPAdapter();
@@ -79,13 +80,29 @@ function getSessionDir(): string {
   return dir;
 }
 
-function getDBPath(): string {
-  return join(getSessionDir(), "context-mode.db");
+// Issue #645 — route through the canonical per-project resolver the MCP
+// server uses (src/server.ts ctx_stats / ctx_search timeline). The
+// previous shared `context-mode.db` literal was a different file from
+// the `<canonical-hash>.db` the server reads, so every OMP user's
+// `ctx_stats` reported zero history and `ctx_search(sort: "timeline")`
+// silently dropped the sort. Mirrors the matching Pi fix and the
+// opencode plugin pattern (src/adapters/opencode/plugin.ts:307).
+function getDBPath(projectDir: string): string {
+  return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
-function getOrCreateDB(): SessionDB {
-  if (!_db) {
-    _db = new SessionDB({ dbPath: getDBPath() });
+function getOrCreateDB(projectDir: string): SessionDB {
+  // Reopen the singleton if the resolved DB path changes. See the
+  // matching Pi extension comment — defensive re-keying on projectDir
+  // hash keeps tests deterministic and stops a stale singleton from
+  // pointing at an earlier projectDir's `<hash>.db`. (#645)
+  const dbPath = getDBPath(projectDir);
+  if (!_db || _dbPath !== dbPath) {
+    if (_db) {
+      try { _db.close(); } catch { /* best effort */ }
+    }
+    _db = new SessionDB({ dbPath });
+    _dbPath = dbPath;
   }
   return _db;
 }
@@ -114,7 +131,11 @@ function deriveSessionId(ctx: Record<string, unknown> | undefined): string {
 // The plugin's default export is the OMP factory; this helper is only
 // imported by tests to clear singletons between cases.
 export function _resetOmpPluginStateForTests(): void {
+  if (_db) {
+    try { _db.close(); } catch { /* best effort */ }
+  }
   _db = null;
+  _dbPath = "";
   _sessionId = "";
 }
 
@@ -168,7 +189,7 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
   // earlier `OMP_PROJECT_DIR` read was an EM mistake — no upstream code
   // ever sets it. Drop it; fall through PI_PROJECT_DIR → cwd().
   const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
-  const db = getOrCreateDB();
+  const db = getOrCreateDB(projectDir);
 
   // ── 1. session_start — initialize session row ─────────
   pi.on("session_start", (_event, ctx) => {

@@ -1,7 +1,7 @@
 import "../setup-home";
-import { describe, it, expect } from "vitest";
+import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { BaseAdapter } from "../../src/adapters/base.js";
 
 /**
@@ -43,6 +43,92 @@ describe("BaseAdapter memory/config defaults", () => {
   it("getMemoryDir defaults to <configDir>/memory", () => {
     const adapter = new TestAdapter([".claude"]);
     expect(adapter.getMemoryDir()).toBe(join(homedir(), ".claude", "memory"));
+  });
+});
+
+// Issue #649 — CONTEXT_MODE_DATA_DIR universal storage override.
+//
+// Several adapters (Pi, OMP, Gemini CLI, Codex, Cursor, …) hardcode their
+// storage root to `~/.<platform>/context-mode/sessions/` with no env-var
+// escape hatch. CI runners, dev containers, and NFS-home users need to point
+// context-mode storage at a writable volume without patching source or
+// changing the host platform's own config-dir variable.
+//
+// Contract for CONTEXT_MODE_DATA_DIR:
+//   - Unset / empty / whitespace-only → use platform-native default (no-op).
+//   - Set                              → `<DATA_DIR>/context-mode/sessions/`
+//                                        for getSessionDir(), and
+//                                        `<DATA_DIR>/context-mode/memory/`
+//                                        for getMemoryDir().
+//   - Tilde + relative path handling mirrors `resolveClaudeConfigDir`
+//     (~ expands to homedir, relative paths resolve against cwd).
+//   - getConfigDir() is platform-native (settings.json, hooks.json) and is
+//     NOT relocated — only context-mode-owned state moves.
+describe("BaseAdapter — CONTEXT_MODE_DATA_DIR override (#649)", () => {
+  const ENV_KEY = "CONTEXT_MODE_DATA_DIR";
+  let original: string | undefined;
+
+  beforeEach(() => {
+    original = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("getSessionDir uses CONTEXT_MODE_DATA_DIR root when set (overrides homedir)", () => {
+    const adapter = new TestAdapter([".pi"]);
+    process.env[ENV_KEY] = "/tmp/custom-data";
+    expect(adapter.getSessionDir()).toBe(
+      resolve("/tmp/custom-data", "context-mode", "sessions"),
+    );
+  });
+
+  it("getSessionDir falls back to <home>/<segments>/context-mode/sessions when env unset", () => {
+    const adapter = new TestAdapter([".pi"]);
+    expect(adapter.getSessionDir()).toBe(
+      join(homedir(), ".pi", "context-mode", "sessions"),
+    );
+  });
+
+  it("getSessionDir treats empty/whitespace env value as unset (safety guard)", () => {
+    const adapter = new TestAdapter([".gemini"]);
+    process.env[ENV_KEY] = "   ";
+    expect(adapter.getSessionDir()).toBe(
+      join(homedir(), ".gemini", "context-mode", "sessions"),
+    );
+  });
+
+  it("getSessionDir expands leading tilde against homedir (~/foo, ~\\foo)", () => {
+    const adapter = new TestAdapter([".omp"]);
+    process.env[ENV_KEY] = "~/relocated-storage";
+    expect(adapter.getSessionDir()).toBe(
+      resolve(homedir(), "relocated-storage", "context-mode", "sessions"),
+    );
+  });
+
+  it("getMemoryDir relocates to <DATA_DIR>/context-mode/memory when env set", () => {
+    const adapter = new TestAdapter([".pi"]);
+    process.env[ENV_KEY] = "/tmp/custom-data";
+    expect(adapter.getMemoryDir()).toBe(
+      resolve("/tmp/custom-data", "context-mode", "memory"),
+    );
+  });
+
+  it("getMemoryDir defaults to <configDir>/memory when env unset", () => {
+    const adapter = new TestAdapter([".pi"]);
+    expect(adapter.getMemoryDir()).toBe(join(homedir(), ".pi", "memory"));
+  });
+
+  it("getConfigDir is NOT relocated by CONTEXT_MODE_DATA_DIR (platform-native settings stay put)", () => {
+    const adapter = new TestAdapter([".pi"]);
+    process.env[ENV_KEY] = "/tmp/custom-data";
+    // settings.json belongs with the platform install, not with context-mode
+    // storage — relocating it would silently fork platform behaviour from
+    // platform tooling. The override only moves context-mode-owned state.
+    expect(adapter.getConfigDir()).toBe(join(homedir(), ".pi"));
   });
 });
 

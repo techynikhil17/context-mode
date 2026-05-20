@@ -26,6 +26,7 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
+import { resolveContextModeDataRoot } from "../base.js";
 import { resolveClaudeConfigDir } from "../../util/claude-config.js";
 import { checkPluginCacheIntegritySync } from "../../util/plugin-cache-integrity.js";
 
@@ -99,7 +100,14 @@ export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdap
   }
 
   getSessionDir(): string {
-    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // before falling back to the Claude-rooted default. The override moves
+    // ONLY context-mode-owned state; settings.json + CLAUDE_CONFIG_DIR stay
+    // intact below.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }

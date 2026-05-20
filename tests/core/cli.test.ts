@@ -1416,6 +1416,27 @@ describe("Cache dir safety (#181)", () => {
     expect(SESSION_SOURCE).toContain("lazy cleanup");
     expect(SESSION_SOURCE).toContain("3600000"); // 1 hour in ms
   });
+
+  // #644: statSync follows symlinks → fresh symlinks pointing at stale targets
+  // were deleted, breaking sessions whose CLAUDE_PLUGIN_ROOT was pinned to one
+  // of those linked versions. lstatSync evaluates the link's own mtime, so a
+  // freshly-created symlink survives the gate even when its target is old.
+  test("sessionstart.mjs cleanup uses lstatSync to age-check entries (#644)", () => {
+    const SESSION_SOURCE = readFileSync(resolve(ROOT, "hooks/sessionstart.mjs"), "utf-8");
+
+    // Isolate the lazy-cleanup block so we don't get false-positives from
+    // unrelated stat calls elsewhere in the file.
+    const blockStart = SESSION_SOURCE.indexOf("Age-gated lazy cleanup");
+    expect(blockStart, "lazy cleanup block must exist").toBeGreaterThan(-1);
+    const block = SESSION_SOURCE.slice(blockStart, blockStart + 1500);
+
+    // The age check MUST use lstatSync (does not follow symlinks).
+    expect(block).toMatch(/lstatSync\(\s*join\(\s*cacheParent\s*,\s*d\s*\)\s*\)/);
+
+    // The age check MUST NOT use statSync (follows symlinks → wrongly evaluates
+    // the link target's mtime, causing fresh symlinks to be deleted).
+    expect(block).not.toMatch(/[^l]statSync\(\s*join\(\s*cacheParent/);
+  });
 });
 
 // ── Issue #185: upgrade must not use execSync (shell) ──

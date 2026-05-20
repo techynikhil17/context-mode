@@ -133,6 +133,26 @@ export interface MCPCallResult {
 // to the transport.
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
+// Retry budget for the bridge bootstrap `initialize` handshake (#647).
+//
+// On cold NFS home dirs, first JIT compile of server.bundle.mjs, or
+// constrained CI runners, the first `initialize` can exceed the 60s
+// ceiling above. Before this fix, bootstrapMCPTools propagated the
+// rejection up to extension.ts, which logged once and continued with
+// NO ctx_* tools registered — silently degrading the session for its
+// entire lifetime while the routing block kept emitting ~2.5K tokens
+// of dead instructions per turn.
+//
+// Retry pattern mirrors the existing #583 single-flight respawn shape:
+// on failure, shut the prior child cleanly, sleep a short backoff so
+// the OS reclaims fds, then start + initialize again. After the budget
+// is exhausted we re-throw and the existing extension.ts handler runs
+// the degrade-and-log path — preserving the contract for genuinely
+// broken servers (binary missing, runtime crash, etc.) while
+// self-healing the transient warm-up case.
+const MAX_INIT_RETRIES = 2;
+const INIT_RETRY_DELAY_MS = 1_000;
+
 class PiTextComponent {
   private text: string;
 
@@ -699,8 +719,45 @@ export async function bootstrapMCPTools(
   }
 
   const client = new MCPStdioClient(serverScript, env, runtime);
-  client.start();
-  await client.initialize();
+
+  // Retry-on-slow-initialize (#647).
+  //
+  // Each attempt is independently bounded by DEFAULT_REQUEST_TIMEOUT_MS
+  // (60s) inside request(). On failure we shutdown the child to release
+  // its fds before respawning — this is the same sequencing the #583
+  // respawn path uses, just hoisted into the bootstrap layer where the
+  // failure happens before any tool was registered. Final attempt's
+  // rejection is re-thrown so extension.ts's existing then/onRejected
+  // handler runs the degrade-and-log path for genuinely broken servers.
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_INIT_RETRIES; attempt++) {
+    try {
+      client.start();
+      await client.initialize();
+      lastError = undefined;
+      break;
+    } catch (err) {
+      lastError = err;
+      if (attempt === MAX_INIT_RETRIES) break;
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[context-mode] WARNING: MCP bridge initialize failed ` +
+          `(attempt ${attempt + 1}/${MAX_INIT_RETRIES + 1}): ${msg}. Retrying…\n`,
+      );
+      // Reclaim the failed child's fds before respawning. shutdown() is
+      // idempotent and bounded by a 5s SIGKILL fallback (#472 round-3),
+      // so a child stuck in an uninterruptible syscall cannot block the
+      // retry loop indefinitely.
+      try {
+        client.shutdown();
+      } catch {
+        // best effort — we are already on the failure path
+      }
+      await new Promise((resolve) => setTimeout(resolve, INIT_RETRY_DELAY_MS));
+    }
+  }
+  if (lastError !== undefined) throw lastError;
+
   const tools = await client.listTools();
   const registered: string[] = [];
 

@@ -16,7 +16,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { SessionDB } from "../../session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import type { ProjectAttribution } from "../../session/project-attribution.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
@@ -132,6 +132,7 @@ export function isSafeCurlWget(segment: string): boolean {
 // ── Module-level DB singleton ────────────────────────────
 
 let _db: SessionDB | null = null;
+let _dbPath = "";
 let _sessionId = "";
 
 // MCP bridge handle. The bridge spawns server.bundle.mjs once and
@@ -207,13 +208,36 @@ function getSessionDir(): string {
   return dir;
 }
 
-function getDBPath(): string {
-  return join(getSessionDir(), "context-mode.db");
+// Issue #645 — the MCP server (src/server.ts ctx_stats / ctx_search
+// timeline) resolves the SessionDB filename via
+// `resolveSessionDbPath({ projectDir, sessionsDir })`, which produces a
+// per-project canonical `<16-hex-hash>.db` (case-folded on darwin/win32,
+// suffixed for non-main worktrees). The Pi extension previously wrote
+// every session to a shared `context-mode.db` literal — a different
+// file the server never reads. The result was silent degradation of
+// `ctx_stats` (zero history) and `ctx_search(sort: "timeline")` (sort
+// dropped) for every Pi user. Routing through the same helper keeps the
+// extension-side writes and the server-side reads aligned across
+// case-fold migrations, worktree suffixes, and any future change to the
+// canonical filename contract.
+function getDBPath(projectDir: string): string {
+  return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
-function getOrCreateDB(): SessionDB {
-  if (!_db) {
-    _db = new SessionDB({ dbPath: getDBPath() });
+function getOrCreateDB(projectDir: string): SessionDB {
+  // Reopen the singleton if the resolved DB path changes. Production code
+  // normally loads the extension once per process with a single workspace,
+  // but defensive re-keying on path keeps the contract honest if a host
+  // ever calls piExtension(pi) twice with different projectDirs, and
+  // removes a subtle test-isolation foot-gun where stale singletons
+  // pointed at a prior test's `<hash>.db`. (#645)
+  const dbPath = getDBPath(projectDir);
+  if (!_db || _dbPath !== dbPath) {
+    if (_db) {
+      try { _db.close(); } catch { /* best effort */ }
+    }
+    _db = new SessionDB({ dbPath });
+    _dbPath = dbPath;
   }
   return _db;
 }
@@ -417,7 +441,7 @@ export default function piExtension(pi: any): void {
   // in shared SessionDB instances.
   const _attribution: Partial<ProjectAttribution> = { projectDir, source: "workspace_root", confidence: 0.98 };
 
-  const db = getOrCreateDB();
+  const db = getOrCreateDB(projectDir);
 
   // ── 1. session_start — Initialize session ──────────────
 
@@ -742,6 +766,7 @@ export default function piExtension(pi: any): void {
         _db.cleanupOldSessions(7);
       }
       _db = null;
+      _dbPath = "";
       _sessionId = "";
     } catch {
       // best effort — never throw during shutdown
@@ -790,7 +815,7 @@ export default function piExtension(pi: any): void {
     description: "Run context-mode diagnostics",
     handler: async (argsOrCtx: unknown, maybeCtx: unknown) => {
       const ctx = resolveCommandContext(argsOrCtx, maybeCtx);
-      const dbPath = getDBPath();
+      const dbPath = getDBPath(projectDir);
       const dbExists = existsSync(dbPath);
       const lines: string[] = [
         "## ctx-doctor (Pi)",

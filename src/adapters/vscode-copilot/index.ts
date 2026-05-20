@@ -21,6 +21,7 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { CopilotBaseAdapter } from "../copilot-base.js";
+import { resolveContextModeDataRoot } from "../base.js";
 import type { CopilotHookInput, CopilotHookModule } from "../copilot-base.js";
 
 import type {
@@ -71,6 +72,17 @@ export class VSCodeCopilotAdapter extends CopilotBaseAdapter {
   }
 
   getSessionDir(): string {
+    // Issue #649: CONTEXT_MODE_DATA_DIR wins over both the .github project
+    // dir and the ~/.vscode fallback so dev-container/CI users can pin
+    // storage to a writable volume regardless of whether a .github tree
+    // happens to exist in cwd.
+    const override = resolveContextModeDataRoot();
+    if (override) {
+      const overrideDir = join(override, "context-mode", "sessions");
+      mkdirSync(overrideDir, { recursive: true });
+      return overrideDir;
+    }
+
     // Prefer .github/context-mode/sessions/ if .github exists,
     // otherwise fall back to ~/.vscode/context-mode/sessions/
     const githubDir = resolve(".github", "context-mode", "sessions");

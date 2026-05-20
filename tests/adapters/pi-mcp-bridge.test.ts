@@ -676,3 +676,144 @@ describe("MCPStdioClient — callTool has no bridge-imposed timeout (#643)", () 
     }
   });
 });
+
+// ── Slice 9 — bootstrap retries on slow `initialize` (#647) ──
+//
+// Reported in #647: when the spawned MCP child is slow to start (cold
+// NFS home dir, first JIT compile of server.bundle.mjs, constrained CI),
+// `initialize` can exceed the 60s ceiling. The bridge then catches the
+// timeout, logs to stderr, and continues with NO `ctx_*` tools
+// registered — the session is silently degraded for its entire lifetime
+// while the routing block keeps spending ~2.5K tokens per turn telling
+// the LLM to call ctx_* tools it cannot reach.
+//
+// The 60s timeout itself is correct (per #643) and must stay. The fix
+// is at the bootstrap layer: on `initialize` failure, shut down the
+// child, respawn, and retry — up to MAX_INIT_RETRIES additional
+// attempts, then degrade as today (let the existing extension-level
+// rejection handler log + run with empty tool list).
+//
+// These tests pin three things:
+//   1. Two consecutive `initialize` failures followed by success → bridge
+//      registers tools normally (recovery happy path).
+//   2. All attempts fail → bootstrap rejects (preserves the existing
+//      "degrade via extension.ts then/onRejected" contract).
+//   3. Each retry shuts down the prior child (no orphan accumulation).
+describe("bootstrapMCPTools — retries on slow initialize (#647)", () => {
+  it("registers tools after two transient initialize timeouts followed by success", async () => {
+    const { bootstrapMCPTools, MCPStdioClient } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+
+    // Track how many initialize/start/shutdown cycles ran.
+    const startCalls: number[] = [];
+    const initCalls: number[] = [];
+    const shutdownCalls: number[] = [];
+
+    let attempt = 0;
+    type AnyClient = MCPStdioClient & { initialized: boolean; exited: boolean };
+
+    // Patch prototype so the inner `new MCPStdioClient(...)` is captured.
+    const realStart = MCPStdioClient.prototype.start;
+    const realInit = MCPStdioClient.prototype.initialize;
+    const realList = MCPStdioClient.prototype.listTools;
+    const realShutdown = MCPStdioClient.prototype.shutdown;
+
+    MCPStdioClient.prototype.start = function (this: AnyClient) {
+      startCalls.push(Date.now());
+      // Stub a non-null `child` so other code paths see a live client.
+      (this as unknown as { child: unknown }).child = { kill: () => true };
+      this.exited = false;
+    };
+    MCPStdioClient.prototype.initialize = async function (this: AnyClient) {
+      attempt++;
+      initCalls.push(attempt);
+      if (attempt <= 2) {
+        // Simulate the exact rejection shape produced by request() on
+        // the 60s timeout — caller must accept any Error-shaped failure.
+        throw new Error("MCP request timeout after 60000ms: initialize");
+      }
+      this.initialized = true;
+    };
+    MCPStdioClient.prototype.listTools = async function () {
+      return [{ name: "ctx_search", description: "search", inputSchema: { type: "object" } }];
+    };
+    MCPStdioClient.prototype.shutdown = function (this: AnyClient) {
+      shutdownCalls.push(Date.now());
+      (this as unknown as { child: unknown }).child = null;
+      this.initialized = false;
+      this.exited = true;
+    };
+
+    try {
+      const registered: string[] = [];
+      const fakePi = {
+        registerTool: (tool: { name: string }) => {
+          registered.push(tool.name);
+        },
+      };
+
+      const handle = await bootstrapMCPTools(fakePi, "/unused/server.mjs", {
+        _resolveJsRuntime: () => "/usr/bin/node",
+      });
+
+      // Happy-path recovery: tool registered after retries.
+      expect(handle.tools).toEqual(["ctx_search"]);
+      expect(registered).toEqual(["ctx_search"]);
+      // Exactly 3 initialize attempts (1 initial + 2 retries).
+      expect(initCalls.length).toBe(3);
+      // Each failed attempt MUST shutdown the prior child before respawn
+      // (no orphan accumulation). Two failures → at least two shutdowns.
+      expect(shutdownCalls.length).toBeGreaterThanOrEqual(2);
+      // start() called once per attempt (3 total).
+      expect(startCalls.length).toBe(3);
+    } finally {
+      MCPStdioClient.prototype.start = realStart;
+      MCPStdioClient.prototype.initialize = realInit;
+      MCPStdioClient.prototype.listTools = realList;
+      MCPStdioClient.prototype.shutdown = realShutdown;
+    }
+  }, 30_000);
+
+  it("rejects after exhausting retries so extension.ts can run its degrade-and-log handler", async () => {
+    const { bootstrapMCPTools, MCPStdioClient } = await import(
+      "../../src/adapters/pi/mcp-bridge.js"
+    );
+
+    const realStart = MCPStdioClient.prototype.start;
+    const realInit = MCPStdioClient.prototype.initialize;
+    const realShutdown = MCPStdioClient.prototype.shutdown;
+
+    let initAttempts = 0;
+    MCPStdioClient.prototype.start = function (this: MCPStdioClient) {
+      (this as unknown as { child: unknown }).child = { kill: () => true };
+      (this as unknown as { exited: boolean }).exited = false;
+    };
+    MCPStdioClient.prototype.initialize = async function () {
+      initAttempts++;
+      throw new Error("MCP request timeout after 60000ms: initialize");
+    };
+    MCPStdioClient.prototype.shutdown = function (this: MCPStdioClient) {
+      (this as unknown as { child: unknown }).child = null;
+      (this as unknown as { exited: boolean }).exited = true;
+    };
+
+    try {
+      const fakePi = { registerTool: vi.fn() };
+      await expect(
+        bootstrapMCPTools(fakePi, "/unused/server.mjs", {
+          _resolveJsRuntime: () => "/usr/bin/node",
+        }),
+      ).rejects.toThrow(/timeout|initialize/i);
+
+      // Must have made the full 1 + MAX_INIT_RETRIES (=2) = 3 attempts
+      // before giving up.
+      expect(initAttempts).toBe(3);
+      expect(fakePi.registerTool).not.toHaveBeenCalled();
+    } finally {
+      MCPStdioClient.prototype.start = realStart;
+      MCPStdioClient.prototype.initialize = realInit;
+      MCPStdioClient.prototype.shutdown = realShutdown;
+    }
+  }, 30_000);
+});

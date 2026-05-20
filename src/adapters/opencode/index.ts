@@ -34,7 +34,7 @@ import {
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
-import { BaseAdapter } from "../base.js";
+import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
 
 import type {
   HookAdapter,
@@ -259,7 +259,14 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // ahead of OpenCode/Kilo's XDG-rooted default. opencode.json + plugin
+    // discovery stay under getConfigDir() so OpenCode itself sees its own
+    // config in the expected location.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }

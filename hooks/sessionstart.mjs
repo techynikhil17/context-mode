@@ -41,7 +41,7 @@ await runHook(async () => {
   const { createSessionLoaders } = await import("./session-loaders.mjs");
   const { join, dirname } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
-  const { readFileSync, unlinkSync, readdirSync, rmSync, statSync } = await import("node:fs");
+  const { readFileSync, unlinkSync, readdirSync, rmSync, lstatSync } = await import("node:fs");
 
   const detectedPlatform = detectPlatformFromEnv();
   const toolNamer = createToolNamer(detectedPlatform);
@@ -234,6 +234,12 @@ await runHook(async () => {
 
       // Age-gated lazy cleanup of old plugin cache version dirs (#181).
       // Only delete dirs older than 1 hour to avoid breaking active sessions.
+      // Use lstatSync (not statSync) so a fresh symlink whose target happens
+      // to be old is evaluated against the symlink's own mtime, not the
+      // target's — otherwise self-heal hooks that re-create breadcrumb
+      // symlinks for previous cache versions would be wiped out and any
+      // session pinned to one of those versions would lose its plugin root
+      // mid-flight (#644).
       try {
         const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
         if (pluginRoot) {
@@ -246,7 +252,7 @@ await runHook(async () => {
             for (const d of readdirSync(cacheParent)) {
               if (d === myDir) continue;
               try {
-                const st = statSync(join(cacheParent, d));
+                const st = lstatSync(join(cacheParent, d));
                 if (now - st.mtimeMs > ONE_HOUR) {
                   rmSync(join(cacheParent, d), { recursive: true, force: true });
                 }

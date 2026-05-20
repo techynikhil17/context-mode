@@ -788,13 +788,24 @@ describe("Pi Extension", () => {
           { sessionManager: { getSessionFile: () => sessionFile } },
         );
 
-        const dbPath = join(
+        // Issue #645 — Pi extension now resolves the SessionDB file
+        // through `resolveSessionDbPath`, the same helper the MCP
+        // server uses. The shared "context-mode.db" literal is gone;
+        // the file lives at <canonical-hash>.db (case-folded on
+        // darwin/win32, worktree-suffixed when applicable). Mirror
+        // the production resolver here so this test reads from the
+        // exact path the extension just wrote to.
+        const { resolveSessionDbPath } = await import("../src/session/db.js");
+        const sessionsDir = join(
           process.env.HOME!,
           ".pi",
           "context-mode",
           "sessions",
-          "context-mode.db",
         );
+        const dbPath = resolveSessionDbPath({
+          projectDir: process.env.PI_PROJECT_DIR!,
+          sessionsDir,
+        });
         const db = new SessionDB({ dbPath });
         try {
           // SQLite datetime('now') stores UTC as "YYYY-MM-DD HH:MM:SS".
@@ -1612,8 +1623,14 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     // DB file must be created under the mocked dir — proof that the
     // extension routes through PiAdapter rather than the hardcoded
-    // ~/.pi/context-mode/sessions literal.
-    const expectedDbPath = join(mockedSessionDir, "context-mode.db");
+    // ~/.pi/context-mode/sessions literal. Issue #645: the filename
+    // inside that dir is the canonical per-project `<hash>.db`, the
+    // same one the MCP server reads via `resolveSessionDbPath`.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const expectedDbPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
     const { existsSync: fileExists } = await import("node:fs");
     expect(fileExists(expectedDbPath)).toBe(true);
 
@@ -1629,5 +1646,93 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     delete process.env.PI_PROJECT_DIR;
     delete process.env.CLAUDE_PROJECT_DIR;
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// Issue #645 — Pi extension opens SessionDB at the canonical
+// per-project hash path (`<hash>.db`), the same file the MCP
+// server reads via `resolveSessionDbPath`. The shared
+// `context-mode.db` literal is divergent — `ctx_stats` and
+// `ctx_search(sort: "timeline")` silently degrade because the
+// MCP server resolves a `<hash>.db` that does not exist.
+// Regression test pins the contract: Pi must use the canonical
+// helper, NOT the hardcoded literal.
+// ═══════════════════════════════════════════════════════════
+
+describe("Pi extension SessionDB path matches MCP server's canonical resolver (#645)", () => {
+  let scratch: string;
+  let mockedSessionDir: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "pi-ext-645-"));
+    mockedSessionDir = join(scratch, "pi-sess");
+    mkdirSync(mockedSessionDir, { recursive: true });
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    vi.doUnmock("../src/adapters/pi/index.js");
+    vi.resetModules();
+    delete process.env.PI_PROJECT_DIR;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  });
+
+  it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not the shared 'context-mode.db' literal", async () => {
+    vi.doMock("../src/adapters/pi/index.js", () => {
+      class MockPiAdapter {
+        getSessionDir() {
+          return mockedSessionDir;
+        }
+      }
+      return { PiAdapter: MockPiAdapter };
+    });
+
+    const projectDir = join(scratch, "project");
+    mkdirSync(projectDir, { recursive: true });
+    process.env.PI_PROJECT_DIR = projectDir;
+    process.env.CLAUDE_PROJECT_DIR = projectDir;
+
+    const localApi = createMockPiApi();
+    const mod = await import("../src/adapters/pi/extension.js");
+    await mod.default(localApi);
+
+    await localApi._trigger("session_start", {}, {});
+
+    // The MCP server (src/server.ts) resolves the SessionDB path via
+    // resolveSessionDbPath({ projectDir, sessionsDir }). The Pi
+    // extension MUST write to the same file. Compute the canonical
+    // path with the SAME helper the server uses and require it to
+    // exist on disk after session_start.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const canonicalPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
+    const { existsSync: fileExists } = await import("node:fs");
+    expect(fileExists(canonicalPath)).toBe(true);
+
+    // The shared literal must NOT be created — that was the bug.
+    const buggyLiteralPath = join(mockedSessionDir, "context-mode.db");
+    // Only fail the "no literal" check when canonical ≠ literal.
+    // (They differ for any real projectDir → 16-hex hash.)
+    if (canonicalPath !== buggyLiteralPath) {
+      expect(fileExists(buggyLiteralPath)).toBe(false);
+    }
+
+    // ctx-doctor must surface the same canonical path so users
+    // diagnosing degraded ctx_stats see the actual on-disk file.
+    const doctor = localApi._getCommand("ctx-doctor");
+    expect(doctor?.handler).toBeDefined();
+    const result = await doctor!.handler!({}, { hasUI: false });
+    const text = String((result as { text?: string } | undefined)?.text ?? "");
+    expect(text).toContain(canonicalPath);
+
+    await localApi._trigger("session_shutdown");
   });
 });

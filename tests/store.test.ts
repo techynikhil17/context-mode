@@ -829,6 +829,89 @@ describe("Source-Scoped Search", () => {
     );
     store.close();
   });
+
+  // Regression: #646 — LIKE wildcards in user-supplied source labels must not leak.
+  // SQLite LIKE treats `_` as "any single char" and `%` as "any sequence". Sources
+  // that naturally contain these (URL-encoded paths, versioned API endpoints,
+  // underscored filenames) silently turned into wildcards and pulled in chunks
+  // from unrelated sources. Fix escapes `_`, `%`, and `\` with ESCAPE '\'.
+  test("source filter does not leak via `_` wildcard in source label (#646)", () => {
+    const store = createStore();
+    store.index({ content: "# A\n\nfoo bar baz qux content matter", source: "api_v1" });
+    store.index({ content: "# B\n\nfoo bar baz qux different content matter", source: "apiXv1" });
+    store.index({ content: "# C\n\nfoo bar baz qux another content matter", source: "api-v1" });
+    store.index({ content: "# D\n\nfoo bar baz qux unrelated matter", source: "completely-other" });
+
+    // BM25 (porter) path
+    const porter = store.search("foo bar baz qux matter", 10, "api_v1");
+    assert.ok(porter.length > 0, "Should match the literal source");
+    assert.ok(
+      porter.every((r) => r.source === "api_v1"),
+      `Underscore must be literal, not LIKE wildcard. Got: ${porter.map((r) => r.source).join(", ")}`,
+    );
+
+    // Trigram path — same scoping contract
+    const trigram = store.searchTrigram("foo bar baz qux matter", 10, "api_v1", "OR");
+    assert.ok(
+      trigram.every((r) => r.source === "api_v1"),
+      `Trigram path must also escape underscore. Got: ${trigram.map((r) => r.source).join(", ")}`,
+    );
+
+    // Fallback (RRF + fuzzy) path
+    const fallback = store.searchWithFallback("foo bar baz qux matter", 10, "api_v1");
+    assert.ok(
+      fallback.every((r) => r.source === "api_v1"),
+      `Fallback path must also escape underscore. Got: ${fallback.map((r) => r.source).join(", ")}`,
+    );
+
+    store.close();
+  });
+
+  test("source filter does not leak via `%` wildcard in source label (#646)", () => {
+    const store = createStore();
+    store.index({ content: "# E\n\nhello world content matter", source: "100%off" });
+    store.index({ content: "# F\n\nhello world stuff matter", source: "100ANYTHINGoff" });
+    store.index({ content: "# G\n\nhello world other matter", source: "unrelated-source" });
+
+    const results = store.search("hello world matter", 10, "100%off");
+    assert.ok(results.length > 0, "Should match literal `100%off`");
+    assert.ok(
+      results.every((r) => r.source === "100%off"),
+      `Percent must be literal, not LIKE wildcard. Got: ${results.map((r) => r.source).join(", ")}`,
+    );
+    store.close();
+  });
+
+  test("source filter still treats partial substring as substring after escaping (#646)", () => {
+    // Confirms the escape fix did not regress legitimate substring matching
+    // for sources without LIKE metacharacters.
+    const store = createStore();
+    store.index({ content: "# H\n\nConfig database.", source: "Node.js v22 CHANGELOG" });
+    store.index({ content: "# I\n\nApp config.", source: "Zod API docs" });
+
+    const results = store.search("config", 5, "v22");
+    assert.ok(results.length > 0, "Plain partial match must still work after escape fix");
+    assert.ok(
+      results.every((r) => r.source.includes("v22")),
+      `Plain substring still works. Got: ${results.map((r) => r.source).join(", ")}`,
+    );
+    store.close();
+  });
+
+  test("source filter handles backslash literal in source label (#646)", () => {
+    // Backslash is the ESCAPE character — must itself be escaped to remain literal.
+    const store = createStore();
+    store.index({ content: "# J\n\nbackslash content matter", source: "path\\to\\thing" });
+    store.index({ content: "# K\n\nbackslash other matter", source: "pathXtoXthing" });
+
+    const results = store.search("backslash matter", 10, "path\\to\\thing");
+    assert.ok(results.length > 0, "Should match the literal backslash source");
+    assert.ok(
+      results.every((r) => r.source === "path\\to\\thing"),
+      `Backslash must be literal. Got: ${results.map((r) => r.source).join(", ")}`,
+    );
+    store.close();
+  });
 });
 
 describe("Context Savings Measurement", () => {
