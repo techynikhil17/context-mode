@@ -343,12 +343,120 @@ function extractGit(input: HookInput): SessionEvent[] {
   const match = GIT_PATTERNS.find(p => p.pattern.test(cmd));
   if (!match) return [];
 
+  // Bug 1 (v1.0.161) — for `git commit` operations, parse -m / -am / --message=
+  // from the Bash command via shell-like argv tokenization so downstream
+  // consumers receive the actual commit subject in `data`. Falls back to the
+  // operation name when no message argument is present (--amend / --no-edit /
+  // -F file / interactive editor flow). Tokenizer is hand-rolled char-by-char
+  // (no regex) to mirror real shell quoting/cluster-flag semantics.
+  //
+  // When a message is captured, the event surfaces as type='git_commit' so the
+  // rollup aggregator can distinguish ACTUAL commits from other git operations
+  // (status/diff/log were inflating has_commit on every event — see
+  // session-loaders.mjs rollup stamp + Bug 2).
+  if (match.operation === "commit") {
+    const msg = extractCommitMessageFromCommand(cmd);
+    if (msg) {
+      return [{
+        type: "git_commit",
+        category: "git",
+        data: safeString(msg),
+        priority: 2,
+      }];
+    }
+  }
+
   return [{
     type: "git",
     category: "git",
     data: safeString(match.operation),
     priority: 2,
   }];
+}
+
+// Shell-like argv tokenizer — handles single/double quotes, backslash escapes,
+// and merges adjacent quoted/unquoted segments per POSIX shell behavior
+// (`echo a"b c"d` → ["ab cd"]). Pure char loop; no regex.
+function tokenizeCommand(cmd: string): string[] {
+  const tokens: string[] = [];
+  const n = cmd.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && (cmd[i] === " " || cmd[i] === "\t")) i++;
+    if (i >= n) break;
+    let buf = "";
+    while (i < n && cmd[i] !== " " && cmd[i] !== "\t") {
+      const ch = cmd[i];
+      if (ch === '"' || ch === "'") {
+        const quote = ch;
+        i++;
+        while (i < n && cmd[i] !== quote) {
+          if (cmd[i] === "\\" && i + 1 < n) {
+            buf += cmd[i + 1];
+            i += 2;
+          } else {
+            buf += cmd[i];
+            i++;
+          }
+        }
+        if (i < n) i++; // consume closing quote
+      } else if (ch === "\\" && i + 1 < n) {
+        buf += cmd[i + 1];
+        i += 2;
+      } else {
+        buf += ch;
+        i++;
+      }
+    }
+    tokens.push(buf);
+  }
+  return tokens;
+}
+
+// Linear scan over argv looking for a commit-message-bearing flag:
+//   --message=<value>   long form, attached value
+//   --message <value>   long form, separate token
+//   -m / -am / -cm ...  short cluster ending in 'm', value in next token
+// Returns null when no message arg is present — caller falls back to
+// operation name. Pure char checks; no regex.
+function extractCommitMessageFromCommand(cmd: string): string | null {
+  const argv = tokenizeCommand(cmd);
+  const longPrefix = "--message=";
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    // Long form: --message=VALUE
+    if (arg.length > longPrefix.length && arg.startsWith(longPrefix)) {
+      const v = arg.slice(longPrefix.length);
+      return v.length > 0 ? v : null;
+    }
+    // Long form: --message VALUE
+    if (arg === "--message") {
+      const v = argv[i + 1];
+      return v && v.length > 0 ? v : null;
+    }
+    // Short cluster ending in 'm' (e.g. -m, -am, -cm). Cluster must be
+    // single-dash followed by only lowercase letters, last letter 'm'.
+    if (
+      arg.length >= 2 &&
+      arg[0] === "-" &&
+      arg[1] !== "-" &&
+      arg[arg.length - 1] === "m" &&
+      isLowerAlphaRun(arg, 1)
+    ) {
+      const v = argv[i + 1];
+      return v && v.length > 0 ? v : null;
+    }
+  }
+  return null;
+}
+
+function isLowerAlphaRun(s: string, start: number): boolean {
+  if (start >= s.length) return false;
+  for (let i = start; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 97 || c > 122) return false; // not a-z
+  }
+  return true;
 }
 
 /**
