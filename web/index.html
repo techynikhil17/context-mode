@@ -178,6 +178,8 @@ pre code{overflow-wrap:normal;word-break:normal;white-space:pre}
 .persona-ret{font-size:14.5px;color:var(--text-2);line-height:1.7;margin-bottom:16px}
 .persona-ret strong{color:var(--text);font-weight:600}
 .persona-act{font-size:13.5px;color:var(--text);font-weight:500;display:flex;align-items:center;gap:8px;padding-top:16px;border-top:1px solid var(--border-light)}
+.persona-price-callout{font-family:var(--mono);font-size:12.5px;color:var(--text-2);line-height:1.55;margin-top:14px;padding:10px 14px;background:var(--accent-light);border-radius:6px;border-left:3px solid var(--accent)}
+.persona-price-callout strong{color:var(--accent-dark);font-weight:700}
 @media(max-width:600px){.persona{padding:24px 20px}.persona-call{white-space:pre-wrap;overflow-x:auto;overflow-wrap:anywhere;word-break:normal}}
 
 /* ── MCP-first feature section (the agentic emphasis) ── */
@@ -691,6 +693,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
         <code class="persona-call">engagement_health(scope: "org", period: "30d")</code>
         <p class="persona-ret"><strong>Org ROI snapshot:</strong> 47 / 47 active. Adoption <strong>100%</strong>. Estimated savings <strong>34 hours / week / engineer</strong> (Think-in-Code substitution rate, high confidence). <code>compare_teams</code> shows Backend leading Frontend by <strong>+18% productivity, −12% error rate</strong>. Quarterly cost per resolved blocker: $42.</p>
         <p class="persona-act">→ Renews the seat license. Board deck has a number.</p>
+        <p class="persona-price-callout">Org pays <strong>47 × $20 = $940 / month</strong>. Renewal is a Stripe quantity update, not a procurement event.</p>
       </div>
 
       <!-- EM -->
@@ -739,6 +742,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
         <code class="persona-call">top_patterns(scope: "org", category: "cost", period: "30d")</code>
         <p class="persona-ret"><strong>Top cost signals:</strong> <code>token_spend_org_high</code> trending <strong>+22%</strong> WoW (Opus 4.7 dominant). <code>cost_per_commit_org</code> $0.84 — within target. <code>tool_waste_high_retry_cost</code> — Frontend retries cost <strong>$1,840 / mo</strong>. <code>agent_efficiency_member_low</code> flags 2 members with low resolved-blocker / spend ratio.</p>
         <p class="persona-act">→ Cost / commit reported in CFO weekly. Frontend pair-programs through retries.</p>
+        <p class="persona-price-callout">The <strong>$50K/mo</strong> AI line item now has a sibling Platform line: <strong>$940/mo</strong> for visibility into the other $50K. Two clicks to defend in the budget review.</p>
       </div>
 
       <!-- DevOps / Engineering Lead -->
