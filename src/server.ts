@@ -58,6 +58,7 @@ import {
   CTX_SEARCH_SHARED_MODE,
   resolveProjectScope,
 } from "./search/ctx-search-schema.js";
+import { FloodGuard } from "./search/flood-guard.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { parseCodexContextModePluginRoot } from "./adapters/codex/index.js";
@@ -2350,11 +2351,35 @@ function readPositiveEnv(name: string, defaultValue: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
 
-let searchCallCount = 0;
-let searchWindowStart = Date.now();
 const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
 const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
 const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
+
+// #769: progressive throttle bucketed PER agent-context, not machine-global.
+// Concurrent subagents share ONE MCP server process; a single global counter
+// summed their independent searches into one budget and hard-blocked
+// legitimate parallel fan-out. The guard keys each actor's window separately
+// so single-actor flood protection is preserved while fan-out is not starved.
+const searchFloodGuard = new FloodGuard({
+  windowMs: SEARCH_WINDOW_MS,
+  softCapAfter: SEARCH_MAX_RESULTS_AFTER,
+  blockAfter: SEARCH_BLOCK_AFTER,
+});
+
+/**
+ * Per-agent flood-guard key. Each concurrent subagent in a Claude Code
+ * Task/Workflow fan-out runs under its own session id (written to SessionDB
+ * via hooks), so currentAttribution().sessionId is the per-agent discriminator
+ * already available MCP-side. Falls back to a single shared bucket when no
+ * identity is resolvable (preserves today's single-threaded behaviour).
+ */
+function searchFloodGuardKey(): string {
+  try {
+    return currentAttribution()?.sessionId ?? "__default__";
+  } catch {
+    return "__default__";
+  }
+}
 
 /**
  * Defensive coercion: parse stringified JSON arrays, AND lift a bare
@@ -2511,20 +2536,17 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         () => getProjectDir(),
       );
 
-      // Progressive throttling: track calls in time window
+      // Progressive throttling: track calls per agent-context window (#769).
       const now = Date.now();
-      if (now - searchWindowStart > SEARCH_WINDOW_MS) {
-        searchCallCount = 0;
-        searchWindowStart = now;
-      }
-      searchCallCount++;
+      const flood = searchFloodGuard.record(searchFloodGuardKey(), now);
+      const searchCallCount = flood.count;
 
-      // After SEARCH_BLOCK_AFTER calls: refuse
-      if (searchCallCount > SEARCH_BLOCK_AFTER) {
+      // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
+      if (flood.blocked) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - searchWindowStart) / 1000)}s. ` +
+            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
               "You're flooding context. STOP making individual search calls. " +
               "Use ctx_batch_execute(commands, queries) for your next research step.",
           }],
@@ -2533,8 +2555,8 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
       }
 
       // Determine per-query result limit based on throttle level
-      const effectiveLimit = searchCallCount > SEARCH_MAX_RESULTS_AFTER
-        ? 1 // after 3 calls: only 1 result per query
+      const effectiveLimit = flood.softCapped
+        ? 1 // after soft cap: only 1 result per query
         : Math.min(limit, 2); // normal: max 2
 
       const MAX_TOTAL = 40 * 1024; // 40KB total cap
