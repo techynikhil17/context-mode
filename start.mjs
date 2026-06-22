@@ -77,18 +77,60 @@ if (typeof globalThis.Bun === "undefined" && process.platform === "linux") {
       stdio: ["pipe", "inherit", "inherit"],
       env: process.env,
     });
+    const _keepAlive = setInterval(() => {}, 2147483647);
+    let _escTerm;
+    let _escKill;
+    let _tearingDown = false;
+    // #862: propagate parent death to the Bun child. When the MCP client (e.g.
+    // Claude Code) exits, its end of our stdin pipe closes. The original proxy
+    // ignored that ("end" was a no-op) and parked forever — so the child was
+    // never told the session was gone: its stdin (this pipe) stayed open and its
+    // direct parent (us) stayed alive, defeating BOTH paths of the child's
+    // lifecycle guard (the stdio-EOF assist AND the ppid poll). The pair
+    // orphaned to init and pinned a CPU core indefinitely. We now forward EOF
+    // (graceful self-reap via the child's own watchdog), then escalate
+    // SIGTERM → SIGKILL so a wedged child can never outlive its client. Still
+    // re-execs under Bun first, so #564's SIGSEGV avoidance is untouched.
+    const teardown = () => {
+      if (_tearingDown) return;
+      _tearingDown = true;
+      clearInterval(_keepAlive);
+      try {
+        if (child.stdin && !child.stdin.destroyed) child.stdin.end();
+      } catch {}
+      // NOT unref'd: these short-lived timers are what hold the event loop
+      // open through the teardown window (≤5 s). Liveness must not depend on
+      // the top-level `await new Promise()` below surviving a future refactor
+      // — if escalation is ever skipped, #862's orphan returns. child.on(
+      // "exit") clears both the instant the child reaps cleanly.
+      _escTerm = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+      }, 2000);
+      _escKill = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+        process.exit(0);
+      }, 5000);
+    };
     process.stdin.on("data", (chunk) => {
       if (!child.stdin.destroyed) child.stdin.write(chunk);
     });
-    process.stdin.on("end", () => {});
-    const _keepAlive = setInterval(() => {}, 2147483647);
+    // EOF, pipe close, or pipe error all mean the client is gone — tear down.
+    process.stdin.on("end", teardown);
+    process.stdin.on("close", teardown);
+    process.stdin.on("error", teardown);
     child.on("exit", (code) => {
       clearInterval(_keepAlive);
+      if (_escTerm) clearTimeout(_escTerm);
+      if (_escKill) clearTimeout(_escKill);
       process.exit(code ?? 0);
     });
     // Prevent rest of start.mjs from running — child owns the MCP session.
     process.stdin.resume();
-    await new Promise(() => {}); // park this process forever
+    await new Promise(() => {}); // park until the child exits (see child 'exit')
   }
 }
 
